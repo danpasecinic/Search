@@ -125,7 +125,9 @@ struct IconTile: View {
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(live ? Palette.ink : Palette.muted)
             } else {
-                Mark(icon: tab.icon, letter: tab.monogram, size: 16, dim: tab.asleep)
+                // The strip shows what the rows with titles would, letters
+                // or icons; icons only has always shown icons.
+                Mark(icon: prefs.narrowStrip && prefs.glyph == .letters ? nil : tab.icon, letter: tab.monogram, size: 16, dim: tab.asleep)
                     .opacity(live || hovering ? 1 : 0.85)
             }
         }
@@ -206,6 +208,8 @@ struct IconTile: View {
             if interactive, let frame = IconTiles.frame(of: me) { IconTiles.seen(tab.id, tile: me, frame: frame, tip: tip) }
         }
         .contextMenu { if interactive { TabMenu(browser: browser, tab: tab, close: close) } }
+        // A pin's tile has no address to open either (idea 1081).
+        .background { if interactive && tab.pin != nil { SiteCardPanel.Square(id: tab.id) } }
         .background {
             if interactive && prefs.splitView && !half {
                 SplitDropZone(browser: browser, tab: tab, kind: .strip)

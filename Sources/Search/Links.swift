@@ -263,9 +263,7 @@ final class Links: NSObject, NSApplicationDelegate {
         // (`open -n` of a second probe) can reach it as a reopen, and nothing
         // is brought back, made or brought forward for it.
         guard !Store.testing else { return false }
-        // The small window on screen counts as a window to macOS; the
-        // browser's, kept away behind it, are what the Dock icon is for.
-        if !flag || Browsers.keptAway { Browsers.ensureWindow() }
+        if Browsers.reopening(anyShown: flag) { Browsers.reopen(anyShown: flag) }
         return true
     }
 
@@ -414,11 +412,16 @@ final class Links: NSObject, NSApplicationDelegate {
     /// A link as another app hands one over, for the bench.
     static func arrived(_ url: URL, sender: String? = nil) { take(url, sender: sender) }
 
-    /// What another app may hand over: a web address, or an email link once
-    /// Search is the Mac's email app (build.sh declares mailto).
+    /// What another app may hand over: a web address, an email link once
+    /// Search is the Mac's email app (build.sh declares mailto), or a page on
+    /// this Mac as an address. Python's webbrowser, and the apps built on it
+    /// that open their local page through a file that sends you on to
+    /// localhost (Jupyter's way), hands a file:// address to the default
+    /// browser with "open location", not as a file to open: dropped here,
+    /// nothing opened (#775), where Safari and Firefox open it.
     private static func takes(_ url: URL) -> Bool {
         let scheme = url.scheme?.lowercased() ?? ""
-        return scheme.hasPrefix("http") || scheme == "mailto"
+        return scheme.hasPrefix("http") || scheme == "mailto" || url.isFileURL
     }
 
     private static func take(_ url: URL, sender: String? = nil, pid: pid_t? = nil) {
@@ -461,7 +464,7 @@ final class Links: NSObject, NSApplicationDelegate {
         let prefs = Shared.prefs
         // A site sent to a space opens there, with that space's sign-ins.
         if SpaceRoutes.space(for: url) != nil { return false }
-        if prefs.littleLinks, prefs.littleFindsTabs, goToOpen(url) { return true }
+        if prefs.linksFindTabs, goToOpen(url) { return true }
         if asksSpace(for: url) {
             keepWindowsAway()
             LinkChooserPanel.shared.ask(url, sender: sender, pid: pid)
@@ -506,9 +509,10 @@ final class Links: NSObject, NSApplicationDelegate {
         Browsers.putAway()
     }
 
-    /// The page already open, for whoever asked for that in Settings: a
-    /// small window that has it comes forward, or a tab that has it, in its
-    /// window, the window in front looked in first. Only each window's
+    /// The page already open, for whoever asked for that in Settings, with
+    /// links opening in tabs or in small windows: a small window that has
+    /// it comes forward, or a tab that has it, in its window, the window in
+    /// front looked in first. Only each window's
     /// space on screen, as the address field's open pages are. False when
     /// none has it.
     @MainActor
@@ -550,7 +554,7 @@ final class Links: NSObject, NSApplicationDelegate {
     static func writeFeedback() {
         var text = URLComponents()
         text.scheme = "mailto"
-        text.path = "hello@officecommun.com"
+        text.path = "hello@searchbrowser.app"
         text.queryItems = [
             URLQueryItem(name: "subject", value: "Search feedback — \(Updater.version) (\(Updater.build))"),
             URLQueryItem(name: "body", value: "\n\n—\nSearch \(Updater.version), build \(Updater.build), macOS \(ProcessInfo.processInfo.operatingSystemVersionString)"),

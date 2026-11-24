@@ -37,6 +37,10 @@ struct Installed: Codable, Identifiable, Equatable {
     /// bring the author's latest edits in. Kept with its links resolved:
     /// the path its id was worked out from.
     var source: String? = nil
+    /// For one added from Settings › Extensions › From Safari apps: the app
+    /// it came in. Reload then copies only while that app's signature still
+    /// holds (SafariApps.still).
+    var fromApp: String? = nil
 
     /// Whether Reload may copy from `source` under this id: a link put on
     /// the way since would bring in another folder, which has another id.
@@ -101,7 +105,6 @@ final class Extensions: NSObject, ObservableObject {
     var clickGrants: [String: [Tab.ID: ClickGrant]] = [:]
     /// Pages you see that are in no window's row (see openedAside).
     private var aside: Set<Tab.ID> = []
-    private var bag = Set<AnyCancellable>()
     /// Each window's adapter, by browser.
     private var windows: [ObjectIdentifier: ExtensionWindow] = [:]
     /// Each window's subscriptions to its row and its tab in front.
@@ -698,6 +701,10 @@ final class Extensions: NSObject, ObservableObject {
             if contexts[item.id] == nil, loadsThisRun.contains(item.id) { loadedBefore.insert(item.id); installing.remove(item.id) }
             loadsThisRun.insert(item.id)
             notStarted[item.id] = nil
+            sessionRulesGiven.remove(item.id)
+            sessionRulesSpilled.remove(item.id)
+            loadedAt[item.id] = Date()
+            sweepKeptSessionRules(item.id)
             contexts[item.id] = context
             openAside(in: context)
             // Keys you gave its commands in Settings › Shortcuts (#189).
@@ -723,13 +730,36 @@ final class Extensions: NSObject, ObservableObject {
     /// work, but WebKit gives extensions no way to stop or change a request
     /// that way, so not one request is blocked (#1208). Said in Settings and
     /// at install rather than leaving a row that looked like any other.
-    static func cantDo(_ manifest: [String: Any]) -> String? {
+    ///
+    /// And on macOS 15, WebAssembly in a Manifest V3 extension's own pages:
+    /// WebKit there refuses to make a WebAssembly instance in them whatever
+    /// their policy says, 'wasm-unsafe-eval' included (a module compiles,
+    /// an instance is refused), where a page with the same policy, or a
+    /// Manifest V2 extension, runs it. Bitwarden's popup then says
+    /// WebAssembly isn't supported (#1383, #716). On macOS 26 it runs. It is
+    /// WebKit's to allow; said here so the extension isn't taken for broken.
+    static func cantDo(_ manifest: [String: Any],
+                       macOS: Int = ProcessInfo.processInfo.operatingSystemVersion.majorVersion) -> String? {
+        let limits = [blocking(manifest), wasm(manifest, macOS: macOS)].compactMap { $0 }
+        return limits.isEmpty ? nil : limits.joined(separator: " ")
+    }
+
+    private static func blocking(_ manifest: [String: Any]) -> String? {
         let asked = (manifest["permissions"] as? [Any] ?? []).compactMap { $0 as? String }
         // One that also has request rules blocks with those.
         guard asked.contains("webRequestBlocking"), !asked.contains(where: { $0.hasPrefix("declarativeNetRequest") }) else { return nil }
         let lite = (manifest["name"] as? String)?.hasPrefix("uBlock Origin") == true
             ? " uBlock Origin Lite, from the Chrome Web Store, blocks them here." : ""
         return "Can’t block requests: Safari’s engine doesn’t let extensions block them with webRequestBlocking. What it does inside pages still works." + lite
+    }
+
+    /// See cantDo: an MV3 extension whose pages' policy asks for WebAssembly.
+    private static func wasm(_ manifest: [String: Any], macOS: Int) -> String? {
+        guard macOS < 26, (manifest["manifest_version"] as? Int) == 3 else { return nil }
+        let policy = manifest["content_security_policy"]
+        let pages = (policy as? [String: Any])?["extension_pages"] as? String ?? policy as? String ?? ""
+        guard pages.contains("wasm-unsafe-eval") else { return nil }
+        return "WebAssembly doesn’t run in its own pages on macOS 15: Safari’s engine there refuses it to these extensions whatever they ask, so parts that need it, like Bitwarden’s popup, won’t open. On macOS 26 they do."
     }
 
     /// WebKit's error in a line: the manifest problem it names, where it
@@ -772,6 +802,9 @@ final class Extensions: NSObject, ObservableObject {
         ExtensionShims.panelTabIDs[id] = nil
         ExtensionShims.panelOff.remove(id)
         if let held = ExtensionShims.awake.removeValue(forKey: id) { IOPMAssertionRelease(held) }
+        sessionRulesGiven.remove(id)
+        sessionRulesSpilled.remove(id)
+        loadedAt[id] = nil
         // Its ports read as gone only once WebKit has had a turn.
         DispatchQueue.main.async { ExtensionNative.stopOrphans() }
         contexts[id] = nil
@@ -857,7 +890,7 @@ final class Extensions: NSObject, ObservableObject {
         installFolder(at: source)
     }
 
-    func installFolder(at source: URL, confirm: Bool = true) {
+    func installFolder(at source: URL, confirm: Bool = true, fromApp: String? = nil) {
         guard FileManager.default.fileExists(atPath: source.appendingPathComponent("manifest.json").path) else {
             browser?.announce("That folder has no manifest.json")
             return
@@ -877,7 +910,7 @@ final class Extensions: NSObject, ObservableObject {
                 try FileManager.default.copyItem(at: source.resolvingSymlinksInPath(), to: staged)
                 try Extensions.unlinkOutside(staged)
                 try ExtensionShims.prepare(staged, fresh: true)
-                try await admit(staged, as: id, fromStore: false, finalFolder: Extensions.folder(for: id), confirm: confirm || !Store.testing, source: source)
+                try await admit(staged, as: id, fromStore: false, finalFolder: Extensions.folder(for: id), confirm: confirm || !Store.testing, source: source, fromApp: fromApp)
             } catch {
                 browser?.announce("Couldn't install the extension: \(error.localizedDescription)")
             }
@@ -907,6 +940,12 @@ final class Extensions: NSObject, ObservableObject {
                 guard original.sourceKeepsID else {
                     browser?.announce("\(original.name) wasn't reloaded — its folder now leads somewhere else")
                     return
+                }
+                if original.fromApp != nil {
+                    guard await Task.detached(priority: .userInitiated, operation: { SafariApps.still(source) }).value else {
+                        browser?.announce("\(original.name) wasn't reloaded — its app's signature doesn't check out")
+                        return
+                    }
                 }
                 do {
                     try FileManager.default.copyItem(at: source.resolvingSymlinksInPath(), to: staged)
@@ -993,6 +1032,38 @@ final class Extensions: NSObject, ObservableObject {
     func installReason(_ id: String) -> String? {
         if installing.remove(id) != nil { return "install" }
         return loadedBefore.contains(id) ? "update" : nil
+    }
+
+    /// Session rules the shim keeps as dynamic ones (see "Session rules,
+    /// kept" in the shim): the extensions that have given this load's set,
+    /// those whose kept rules went back to being session rules to make room
+    /// for dynamic ones, and when each loaded. None outlives the load, as
+    /// session rules don't.
+    var sessionRulesGiven: Set<String> = []
+    var sessionRulesSpilled: Set<String> = []
+    private(set) var loadedAt: [String: Date] = [:]
+
+    /// Whether any of its session rules are kept, from one launch to the next.
+    func keepsSessionRules(_ id: String, _ any: Bool) {
+        if any { Store.settings.set(true, forKey: "extensions.kept.\(id)") }
+        else { Store.settings.removeObject(forKey: "extensions.kept.\(id)") }
+    }
+
+    /// The shim's background takes away kept session rules not given again
+    /// 30 s after loading, on a timer that never runs if the background
+    /// isn't running then: WebKit hadn't started it, or put it to sleep
+    /// first. A few seconds after that, it is started, and takes them away
+    /// as it starts. Without this, rules from the last launch could hold
+    /// until the extension next sets any.
+    private func sweepKeptSessionRules(_ id: String) {
+        guard Store.settings.bool(forKey: "extensions.kept.\(id)") else { return }
+        let loaded = loadedAt[id]
+        DispatchQueue.main.asyncAfter(deadline: .now() + 35) { [weak self] in
+            guard let self, self.loadedAt[id] == loaded, !self.sessionRulesGiven.contains(id),
+                  Store.settings.bool(forKey: "extensions.kept.\(id)"),
+                  let context = self.contexts[id], context.webExtension.hasBackgroundContent else { return }
+            context.loadBackgroundContent { _ in }
+        }
     }
 
     @discardableResult
@@ -1097,11 +1168,11 @@ final class Extensions: NSObject, ObservableObject {
 
     /// Reads what was unpacked, asks, and — on yes — moves it into place and
     /// loads it. On no, nothing is left behind.
-    private func admit(_ staged: URL, as id: String, fromStore: Bool, finalFolder: URL, confirm: Bool = true, source: URL? = nil) async throws {
+    private func admit(_ staged: URL, as id: String, fromStore: Bool, finalFolder: URL, confirm: Bool = true, source: URL? = nil, fromApp: String? = nil) async throws {
         let found = try await WKWebExtension(resourceBaseURL: staged)
         let name = found.displayName ?? id
         let wants = Extensions.describe(found, in: staged)
-        let accepted = confirm ? await ask(install: name, wants: wants, icon: found.icon(for: CGSize(width: 64, height: 64))) : true
+        let accepted = confirm ? await ask(install: name, wants: wants, icon: found.icon(for: CGSize(width: 64, height: 64)), fromApp: fromApp) : true
         guard accepted, !installed.contains(where: { $0.id == id }) else { return }
         let permissions = Extensions.grants(found, in: staged)
         try ExtensionFiles.replace(staged, at: finalFolder)
@@ -1111,7 +1182,8 @@ final class Extensions: NSObject, ObservableObject {
         let item = Installed(
             id: id, name: name, version: found.version ?? "?", enabled: true, fromStore: fromStore,
             permissions: permissions,
-            source: source?.path
+            source: source?.path,
+            fromApp: fromApp
         )
         installed.removeAll { $0.id == id }
         installed.append(item)
@@ -1143,6 +1215,8 @@ final class Extensions: NSObject, ObservableObject {
         Store.settings.removeObject(forKey: "extensions.private.\(id)")
         SiteAccess.forget(id)
         clickGrants[id] = nil
+        Store.settings.removeObject(forKey: "extensions.kept.\(id)")
+        ExtensionPopup.forget(id)
         installed.removeAll { $0.id == id }
         save()
         try? FileManager.default.removeItem(at: Extensions.folder(for: id))
@@ -1313,10 +1387,31 @@ final class Extensions: NSObject, ObservableObject {
 
     private(set) var updateClock: Timer?
     private var updating: Set<String> = []
+    /// The round of checks under way, so another waits for it to end.
+    private(set) var updateRound: Task<Void, Never>?
+
+    static let checkedKey = "extensions.checked"
+    static let retryKey = "extensions.retry"
+    static let failuresKey = "extensions.failures"
+    static let checkEvery: TimeInterval = 60 * 60 * 20
+
+    /// After a failed check, the next one: an hour, then two, four… never
+    /// more than the usual day. The clock ticks hourly, a few minutes late at
+    /// most, so a retry an hour on waits for the tick an hour on, not two.
+    nonisolated static func retryDelay(failures: Int) -> TimeInterval {
+        min(60 * 60 * pow(2, Double(max(failures, 1) - 1)), checkEvery)
+    }
+
+    nonisolated static func updateDue(checked: Date?, retry: Date?, now: Date) -> Bool {
+        if let retry { return now >= retry.addingTimeInterval(-60 * 5) }
+        return now.timeIntervalSince(checked ?? .distantPast) > checkEvery
+    }
 
     /// Once a day, the store is asked whether anything installed from it has
     /// a newer version; if so it is fetched, checked and swapped in. One that
-    /// asks for more than it was installed with is asked about first.
+    /// asks for more than it was installed with is asked about first. The day
+    /// counts from a check that worked: one that failed (no network yet after
+    /// a wake, the store down) is tried again an hour later, then less often.
     func checkForUpdates() {
         // A browser left open for days must keep checking, even if today's check is not due.
         if updateClock == nil {
@@ -1325,28 +1420,50 @@ final class Extensions: NSObject, ObservableObject {
             }
             updateClock?.tolerance = 60 * 5
         }
-        let key = "extensions.checked"
-        let last = Store.settings.object(forKey: key) as? Date ?? .distantPast
-        guard Date().timeIntervalSince(last) > 60 * 60 * 20 else { return }
-        Store.settings.set(Date(), forKey: key)
-        for item in installed where item.fromStore {
-            Task { await update(item) }
+        let settings = Store.settings
+        guard updateRound == nil,
+              Extensions.updateDue(checked: settings.object(forKey: Extensions.checkedKey) as? Date,
+                                   retry: settings.object(forKey: Extensions.retryKey) as? Date, now: Date())
+        else { return }
+        let items = installed.filter(\.fromStore)
+        guard !items.isEmpty else { return updatesChecked(failed: false) }
+        updateRound = Task { [weak self] in
+            guard let self else { return }
+            let checks = items.map { item in Task { await self.update(item) } }
+            var failed = false
+            for check in checks where !(await check.value) { failed = true }
+            updatesChecked(failed: failed)
+            updateRound = nil
         }
     }
 
-    func update(_ item: Installed) async {
+    private func updatesChecked(failed: Bool) {
+        let settings = Store.settings
+        if failed {
+            let failures = settings.integer(forKey: Extensions.failuresKey) + 1
+            settings.set(failures, forKey: Extensions.failuresKey)
+            settings.set(Date().addingTimeInterval(Extensions.retryDelay(failures: failures)), forKey: Extensions.retryKey)
+        } else {
+            settings.set(Date(), forKey: Extensions.checkedKey)
+            settings.removeObject(forKey: Extensions.retryKey)
+            settings.removeObject(forKey: Extensions.failuresKey)
+        }
+    }
+
+    /// Asks the store about one extension and takes in a newer version.
+    /// False when that failed — no answer, a package that didn't download or
+    /// check out — so the round is tried again soon; true once the store has
+    /// answered and whatever followed is done or, waiting on a question
+    /// about more access, handed on.
+    @discardableResult
+    func update(_ item: Installed) async -> Bool {
         // Permission approval can wait past the next check; its staging folder must stay its own.
-        guard updating.insert(item.id).inserted else { return }
-        defer { updating.remove(item.id) }
-        var parts = URLComponents(string: "https://clients2.google.com/service/update2/crx")!
-        parts.queryItems = [
-            URLQueryItem(name: "response", value: "updatecheck"),
-            URLQueryItem(name: "prodversion", value: Crx.chromeVersion),
-            URLQueryItem(name: "acceptformat", value: "crx3"),
-            URLQueryItem(name: "x", value: "id=\(item.id)&v=\(item.version)&uc"),
-        ]
-        guard let url = parts.url,
-              let (data, _) = try? await ProxyNetwork.session.data(from: url),
+        guard updating.insert(item.id).inserted else { return true }
+        var handedOn = false
+        defer { if !handedOn { updating.remove(item.id) } }
+        guard let request = Crx.updateCheckRequest(id: item.id, version: item.version),
+              let (data, response) = try? await ProxyNetwork.session.data(for: request),
+              (response as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) ?? true,
               let xml = String(data: data, encoding: .utf8),
               // The answer is the <updatecheck> element alone: status="ok"
               // with a version when there is a newer one, "noupdate" when
@@ -1354,44 +1471,65 @@ final class Extensions: NSObject, ObservableObject {
               // the XML declaration's "1.0", and status="ok" is on <app>
               // either way — which took every reply for an update.
               let check = xml.range(of: #"<updatecheck\b[^>]*>"#, options: .regularExpression)
-                .map({ String(xml[$0]) }),
-              check.contains("status=\"ok\""),
+                .map({ String(xml[$0]) })
+        else { return false }
+        // noupdate, or an error about this one (gone from the store): an answer.
+        guard check.contains("status=\"ok\""),
               let version = check.range(of: #"\bversion="([^"]+)""#, options: .regularExpression)
                 .map({ String(check[$0].dropFirst(9).dropLast()) }),
               version != item.version
-        else { return }
+        else { return true }
+        let staged = Extensions.stagingFolder(for: item.id)
+        var keepStaged = false
+        defer { if !keepStaged { try? FileManager.default.removeItem(at: staged) } }
         do {
             let zip = try Crx.verifiedZip(try await Crx.fetch(item.id), id: item.id)
-            let staged = Extensions.stagingFolder(for: item.id)
-            defer { try? FileManager.default.removeItem(at: staged) }
             try Crx.unpack(zip, into: staged)
             try ExtensionShims.prepare(staged, fresh: true)
             let found = try await WKWebExtension(resourceBaseURL: staged)
             guard let current = installed.first(where: { $0.id == item.id }), current.fromStore,
-                  current.version == item.version else { return }
+                  current.version == item.version else { return true }
             // Everything it could do, sites included, against what it was
             // allowed when it was added or last asked about.
             let wants = Set(Extensions.grants(found, in: staged))
-            if !wants.isSubset(of: Set(current.permissions)) {
-                guard await ask(install: "An update to \(item.name)", wants: Extensions.describe(found, in: staged), icon: found.icon(for: CGSize(width: 64, height: 64)), updating: true) else {
-                    return
+            guard wants.isSubset(of: Set(current.permissions)) else {
+                // The answer can take days; the round doesn't wait for it.
+                handedOn = true
+                keepStaged = true
+                Task { [weak self] in
+                    defer {
+                        try? FileManager.default.removeItem(at: staged)
+                        self?.updating.remove(item.id)
+                    }
+                    guard let self, await ask(install: "An update to \(item.name)", wants: Extensions.describe(found, in: staged), icon: found.icon(for: CGSize(width: 64, height: 64)), updating: true) else {
+                        return
+                    }
+                    do { try await swapIn(item, staged: staged, found: found, version: version, wants: wants, permissions: current.permissions) }
+                    catch { NSLog("Extensions: update of %@ failed: %@", item.id, error.localizedDescription) }
                 }
+                return true
             }
-            guard let index = installed.firstIndex(where: { $0.id == item.id }), installed[index].fromStore,
-                  installed[index].version == item.version,
-                  installed[index].permissions == current.permissions else { return }
-            let target = Extensions.folder(for: item.id)
-            try ExtensionFiles.replace(staged, at: target)
-            unload(item.id)
-            errors[item.id] = nil
-            workersChanged()
-            installed[index].version = found.version ?? version
-            installed[index].permissions = wants.sorted()
-            save()
-            if installed[index].enabled { await load(installed[index]) }
+            try await swapIn(item, staged: staged, found: found, version: version, wants: wants, permissions: current.permissions)
+            return true
         } catch {
             NSLog("Extensions: update of %@ failed: %@", item.id, error.localizedDescription)
+            return false
         }
+    }
+
+    private func swapIn(_ item: Installed, staged: URL, found: WKWebExtension, version: String, wants: Set<String>, permissions: [String]) async throws {
+        guard let index = installed.firstIndex(where: { $0.id == item.id }), installed[index].fromStore,
+              installed[index].version == item.version,
+              installed[index].permissions == permissions else { return }
+        let target = Extensions.folder(for: item.id)
+        try ExtensionFiles.replace(staged, at: target)
+        unload(item.id)
+        errors[item.id] = nil
+        workersChanged()
+        installed[index].version = found.version ?? version
+        installed[index].permissions = wants.sorted()
+        save()
+        if installed[index].enabled { await load(installed[index]) }
     }
 
     /// The page the manifest names for the button, when WebKit hasn't said.
@@ -1449,9 +1587,12 @@ final class Extensions: NSObject, ObservableObject {
         let patterns = context.webExtension.allRequestedMatchPatterns.filter { !withheld($0) }
         for pattern in patterns {
             // WebKit copies injected scripts per granted pattern. A wildcard
-            // already covers its named hosts; keep schemes and paths unchanged.
+            // already covers its named hosts, and a site's /* its narrower
+            // paths (Enhancer for YouTube's /embed/*, /live_chat*, /shorts/*
+            // had its scripts run four times on every YouTube page, #1465);
+            // keep schemes unchanged.
             let covered = patterns.contains { other in
-                other.string != pattern.string && other.scheme == pattern.scheme && other.path == pattern.path
+                other.string != pattern.string && other.scheme == pattern.scheme
                     && other.matches(pattern) && (!pattern.matches(other) || other.string < pattern.string)
             }
             guard !covered else { continue }
@@ -1665,10 +1806,11 @@ final class Extensions: NSObject, ObservableObject {
         return out
     }
 
-    func ask(install name: String, wants: [String], icon: NSImage?, updating: Bool = false) async -> Bool {
+    func ask(install name: String, wants: [String], icon: NSImage?, updating: Bool = false, fromApp: String? = nil) async -> Bool {
         await ask(
             "Add “\(name)” to Search?",
-            detail: wants.isEmpty ? "It doesn't ask for anything special." : "It will be able to:\n• " + wants.joined(separator: "\n• "),
+            detail: (fromApp.map { "From the Safari extension in “\($0)”.\n\n" } ?? "")
+                + (wants.isEmpty ? "It doesn't ask for anything special." : "It will be able to:\n• " + wants.joined(separator: "\n• ")),
             icon: icon, yes: "Add Extension", no: "Cancel", updating: updating
         )
     }
@@ -2370,11 +2512,42 @@ struct ExtensionSlot: View {
     /// How many pinned ones the row has room for; the rest are only in the
     /// list. Nil: all of them.
     var room: Int? = nil
+    /// The puzzle with the list; Settings can hide it, leaving the pinned
+    /// extensions' buttons (idea 426).
+    var puzzle = true
+    /// Whether this is the copy in sight. With Buttons at the top on, the
+    /// column draws its row of doors twice, up top and at the foot, and
+    /// hides the one not in use (see FetchDoor.live).
+    var live = true
 
     var body: some View {
         if #available(macOS 15.4, *) {
-            ExtensionButtons(browser: browser, extensions: .shared, edge: edge, room: room)
+            ExtensionButtons(browser: browser, extensions: .shared, edge: edge, room: room, puzzle: puzzle, live: live)
         }
+    }
+}
+
+/// Whether one copy of a window's puzzle has its list open. The window's
+/// flag (Extensions.menuOwner) says that its list is open; only the copy
+/// in sight holds it. Both copies of the doors' row were bound to the flag
+/// alone: both hung a popover, and the hidden one, closed by SwiftUI as it
+/// stood at no size, let go of the flag and closed the list the person had
+/// just opened (idea 1021).
+enum PuzzleList {
+    /// This copy's list is showing.
+    static func open(owner: ObjectIdentifier?, key: ObjectIdentifier, live: Bool) -> Bool {
+        live && owner == key
+    }
+    /// The flag after a press on this copy: only the copy in sight opens
+    /// or closes it.
+    static func pressed(owner: ObjectIdentifier?, key: ObjectIdentifier, live: Bool) -> ObjectIdentifier? {
+        guard live else { return owner }
+        return owner == key ? nil : key
+    }
+    /// The flag after this copy's popover closed on its own (a click
+    /// outside it): let go only if the list was this copy's to show.
+    static func closed(owner: ObjectIdentifier?, key: ObjectIdentifier, live: Bool) -> ObjectIdentifier? {
+        open(owner: owner, key: key, live: live) ? nil : owner
     }
 }
 
@@ -2384,6 +2557,8 @@ private struct ExtensionButtons: View {
     @ObservedObject var extensions: Extensions
     let edge: Edge
     var room: Int?
+    var puzzle = true
+    var live = true
 
     var body: some View {
         if !extensions.installed.isEmpty {
@@ -2394,17 +2569,23 @@ private struct ExtensionButtons: View {
                         .contextMenu { ExtensionActions(id: button.id, name: button.name, browser: browser, extensions: extensions) }
                 }
                 let key = Extensions.menuKey(browser)
-                Door(icon: "puzzlepiece.extension", on: extensions.menuOwner == key, help: "Extensions") {
-                    extensions.menuOwner = extensions.menuOwner == key ? nil : key
+                Door(icon: "puzzlepiece.extension", on: PuzzleList.open(owner: extensions.menuOwner, key: key, live: live),
+                     help: "Extensions", nudge: 1) {
+                    extensions.menuOwner = PuzzleList.pressed(owner: extensions.menuOwner, key: key, live: live)
                 }
                 .background(Anchor(id: Extensions.menuAnchor, browser: browser))
-                // This window's list only: closing, it lets go of the flag
-                // only if the flag is still its own.
-                .popover(isPresented: Binding(get: { extensions.menuOwner == key },
-                                              set: { if !$0, extensions.menuOwner == key { extensions.menuOwner = nil } }),
+                // This window's list, from the copy in sight only: closing,
+                // it lets go of the flag only if the list was its own.
+                .popover(isPresented: Binding(get: { PuzzleList.open(owner: extensions.menuOwner, key: key, live: live) },
+                                              set: { if !$0 { extensions.menuOwner = PuzzleList.closed(owner: extensions.menuOwner, key: key, live: live) } }),
                          hangingFrom: edge) {
                     ExtensionMenu(browser: browser, extensions: extensions)
                 }
+                // Hidden, it stays as a point to hang the list and popups
+                // from: an extension's own key still opens them.
+                .opacity(puzzle ? 1 : 0)
+                .frame(width: puzzle ? nil : 0)
+                .allowsHitTesting(puzzle)
             }
         }
     }

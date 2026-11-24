@@ -149,6 +149,9 @@ enum Browsers {
         // now, or closing it would retire it.
         if browser.tucked, browser.mergeID == nil { OneWindow.untuck(browser) }
         register(browser)
+        // In the Window menu and the Dock icon's, where ⌘` finds it too:
+        // SwiftUI leaves its own window out of both (idea 1047).
+        if !browser.tucked, let window = browser.window, window.isExcludedFromWindowsMenu { window.isExcludedFromWindowsMenu = false }
         browser.shut = false
         Front.shared.set(browser)
         Spaces.current = browser.spaceID
@@ -210,6 +213,33 @@ enum Browsers {
         let kept = all.first { $0.shut && !$0.isPopup } ?? all.first ?? SceneSlot.shared.browser
         show(kept)
         return kept
+    }
+
+    /// Whether a click on the Dock icon brings a browser window, given
+    /// whether AppKit counts any window of the app as shown (`anyShown`).
+    /// The small window on screen counts as one to macOS, and so do the
+    /// floating video's, a download's and a recording's: with the browser's
+    /// windows minimised, covered or on another Space, the click did
+    /// nothing, the browser nowhere to be seen (idea 1047). So one comes
+    /// whenever none is in sight; one already in sight is macOS's to bring
+    /// forward with the app.
+    static func reopening(anyShown: Bool) -> Bool {
+        if !anyShown || keptAway { return true }
+        return !all.contains { browser in
+            guard browser.isOpen, !browser.isPopup, let window = browser.window, !isAway(window) else { return false }
+            return !window.isMiniaturized && window.occlusionState.contains(.visible)
+        }
+    }
+
+    /// The Dock icon clicked with no browser window in sight (see
+    /// reopening): the one in front comes, out of the Dock if it is there.
+    /// AppKit takes one out of the Dock itself only when nothing of the app
+    /// is shown.
+    static func reopen(anyShown: Bool) {
+        let browser = ensureWindow()
+        guard anyShown, !browser.isPopup, let window = browser.window else { return }
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        window.makeKeyAndOrderFront(nil)
     }
 
     /// A window showing the space `id`, found from the one ensureWindow
@@ -564,10 +594,19 @@ enum Browsers {
         // as they were written, not dropped. They come back once the first
         // window is on screen, and a launch for a small window can end
         // before one ever is.
-        if !restored { records += read().dropFirst() }
+        if !restored { records = carried(records, over: read()) }
         // Frozen before it goes to the Disk queue.
         let snapshot = records
         Disk.write(file, now: now) { try? JSONEncoder().encode(snapshot) }
+    }
+
+    /// The windows open, then last time's that aren't among them: each
+    /// window once, an open one as it is now. Appending the file whole wrote
+    /// a window brought up before the others twice, and the file doubled up
+    /// from save to save until they were brought back.
+    static func carried(_ open: [WindowRecord], over stored: [WindowRecord]) -> [WindowRecord] {
+        var seen = Set(open.map(\.id))
+        return open + stored.dropFirst().filter { seen.insert($0.id).inserted }
     }
 
     /// Soon, not now: a window being dragged moves many times a second.

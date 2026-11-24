@@ -22,6 +22,63 @@ enum SiteCardPanel {
     private static var resign: Any?
 
     static var isShown: Bool { panel != nil }
+    /// The tab the card that is up is about.
+    private(set) static weak var shownTab: Tab?
+
+    // MARK: - a pin's square
+
+    /// A pin drawn as a square has no address to open, so the card hangs
+    /// from the square itself (idea 1081): each square on screen, by its tab.
+    private static let squares = NSMapTable<NSString, NSView>.strongToWeakObjects()
+
+    static func square(for id: Tab.ID) -> NSView? {
+        guard let view = squares.object(forKey: id.uuidString as NSString),
+              view.window != nil, !view.isHiddenOrHasHiddenAncestor else { return nil }
+        return view
+    }
+
+    /// Put behind a pin's square: where its card hangs from. Never hit, so
+    /// the square's clicks stay the square's.
+    struct Square: NSViewRepresentable {
+        let id: Tab.ID
+        func makeNSView(context: Context) -> NSView {
+            let view = Spot()
+            squares.setObject(view, forKey: id.uuidString as NSString)
+            return view
+        }
+        func updateNSView(_ view: NSView, context: Context) {
+            squares.setObject(view, forKey: id.uuidString as NSString)
+        }
+        private final class Spot: NSView {
+            override func hitTest(_ point: NSPoint) -> NSView? { nil }
+        }
+    }
+
+    /// The card under a pin's square, from its menu's Site Information…;
+    /// a click anywhere but the card puts it away, as the address bar's
+    /// button's does.
+    static func show(for tab: Tab, in browser: Browser, square: NSView) {
+        // After the edit any other tab had is let go of (follow hides the
+        // card as an edit ends), so this card isn't put away with it.
+        DispatchQueue.main.async {
+            guard square.window != nil else { return }
+            toggle(for: tab, in: browser, under: square, button: square)
+        }
+    }
+
+    /// Where the card is and the field with the caret it should hang from,
+    /// on the screen, for the bench: [x, y, width, height] each.
+    static func geometry(_ browser: Browser) -> [String: [Double]] {
+        var out: [String: [Double]] = [:]
+        let rect = { (r: NSRect) in [r.minX, r.minY, r.width, r.height].map { Double($0) } }
+        if let panel { out["card"] = rect(panel.frame) }
+        if let window = browser.window ?? Links.window { out["window"] = rect(window.frame) }
+        if let window = browser.window ?? Links.window,
+           let field = (window.firstResponder as? NSTextView)?.delegate as? NSTextField ?? anchor, field.window != nil {
+            out["field"] = rect(window.convertToScreen(field.convert(field.bounds, to: nil)))
+        }
+        return out
+    }
 
     // MARK: - when
 
@@ -50,7 +107,7 @@ enum SiteCardPanel {
                         // The edit began: the card comes up under the field once it
                         // is in its window.
                         original = draft
-                        place(tab, browser, tries: 0)
+                        if browser.tabEditCard { place(tab, browser, tries: 0) }
                     } else if draft != original {
                         // Typing somewhere else: the card was about the page you are on.
                         hide()
@@ -59,18 +116,72 @@ enum SiteCardPanel {
             }
     }
 
-    private static func place(_ tab: Tab, _ browser: Browser, tries: Int) {
+    /// Shown once the field it hangs from is on the window and has stopped
+    /// moving: the same place at two looks a moment apart. A double-click
+    /// on a tab you aren't on picks it with the first click and opens its
+    /// address with the second, while the row is still settling around the
+    /// tab now in front, and the field may not be where it ends up yet: the
+    /// card came up near the middle of the screen (#1310).
+    private static func place(_ tab: Tab, _ browser: Browser, tries: Int, last: NSRect? = nil) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) {
             guard original != nil, browser.editingTab == tab.id, browser.tabDraft == original else { return }
-            // The field with the caret in it is the one on screen; failing
-            // that, the latest one made.
-            let focused = ((browser.window ?? Links.window)?.firstResponder as? NSTextView)?.delegate as? NSTextField
-            guard let field = focused ?? anchor, field.window != nil else {
+            guard let field = field(in: browser), let spot = spot(of: field) else {
                 if tries < 15 { place(tab, browser, tries: tries + 1) }
                 return
             }
+            if spot != last, tries < 15 { return place(tab, browser, tries: tries + 1, last: spot) }
             show(for: tab, in: browser, under: field)
+            keepUnder(browser)
         }
+    }
+
+    /// The field with the caret in it, the one on screen; failing that, the
+    /// latest one made.
+    private static func field(in browser: Browser) -> NSView? {
+        let focused = ((browser.window ?? Links.window)?.firstResponder as? NSTextView)?.delegate as? NSTextField
+        return focused ?? anchor
+    }
+
+    /// Where `field` is on the screen, when it is somewhere the card can hang
+    /// from: in a window, shown, with a size, and inside the window's content.
+    private static func spot(of field: NSView) -> NSRect? {
+        guard let window = field.window, !field.isHiddenOrHasHiddenAncestor, !field.bounds.isEmpty,
+              let content = window.contentView else { return nil }
+        let inWindow = field.convert(field.bounds, to: nil)
+        guard content.frame.intersects(inWindow), !field.visibleRect.isEmpty else { return nil }
+        return window.convertToScreen(inWindow)
+    }
+
+    /// While the card is up, it goes where the field goes: the row moving on
+    /// as a tab opens, closes or settles beside it.
+    private static var follower: Timer?
+    private static func keepUnder(_ browser: Browser) {
+        follower?.invalidate()
+        follower = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak browser] _ in
+            MainActor.assumeIsolated {
+                guard let browser, let panel, let field = field(in: browser), let spot = spot(of: field) else { return }
+                let (origin, _) = placement(panel.frame.size, under: spot, on: field.window?.screen)
+                if panel.frame.origin != origin { panel.setFrameOrigin(origin) }
+            }
+        }
+    }
+
+    /// Under the address, lined up with the tab's own edge — or over it,
+    /// for a tab too near the bottom of the screen to have the room. Only
+    /// ever beside the field: pushed up onto it, the card covered the
+    /// address being edited, and what was typed there with it. True when
+    /// it is over the field.
+    private static func placement(_ size: NSSize, under spot: NSRect, on screen: NSScreen?) -> (NSPoint, Bool) {
+        var origin = NSPoint(x: spot.minX - 12, y: spot.minY - 12 - size.height)
+        var above = false
+        if let screen = screen?.visibleFrame {
+            origin.x = min(max(origin.x, screen.minX + 8), screen.maxX - size.width - 8)
+            if origin.y < screen.minY + 8 {
+                above = true
+                origin.y = min(spot.maxY + 12, screen.maxY - size.height - 8)
+            }
+        }
+        return (origin, above)
     }
 
     /// From a button of its own, the address bar's (AddressLine.swift): the
@@ -95,6 +206,7 @@ enum SiteCardPanel {
     private static func show(for tab: Tab, in browser: Browser, under field: NSView) {
         guard let window = field.window else { return }
         hide()
+        shownTab = tab
         let card = SiteCard(browser: browser, tab: tab) {
             SiteCardPanel.hide()
             browser.cancelTabEdit()
@@ -125,20 +237,7 @@ enum SiteCardPanel {
         panel.hasShadow = true
         panel.becomesKeyOnlyIfNeeded = true
         panel.hidesOnDeactivate = true
-        // Under the address, lined up with the tab's own edge — or over it,
-        // for a tab too near the bottom of the screen to have the room. Only
-        // ever beside the field: pushed up onto it, the card covered the
-        // address being edited, and what was typed there with it.
-        let spot = window.convertToScreen(field.convert(field.bounds, to: nil))
-        var origin = NSPoint(x: spot.minX - 12, y: spot.minY - 12 - size.height)
-        var above = false
-        if let screen = window.screen?.visibleFrame {
-            origin.x = min(max(origin.x, screen.minX + 8), screen.maxX - size.width - 8)
-            if origin.y < screen.minY + 8 {
-                above = true
-                origin.y = min(spot.maxY + 12, screen.maxY - size.height - 8)
-            }
-        }
+        let (origin, above) = placement(size, under: window.convertToScreen(field.convert(field.bounds, to: nil)), on: window.screen)
         panel.setFrameOrigin(origin)
         window.addChildWindow(panel, ordered: .above)
         // Its size follows the card, keeping the edge nearest the address
@@ -171,6 +270,9 @@ enum SiteCardPanel {
     }
 
     static func hide() {
+        shownTab = nil
+        follower?.invalidate()
+        follower = nil
         if let resign { NotificationCenter.default.removeObserver(resign) }
         resign = nil
         if let clicks { NSEvent.removeMonitor(clicks) }
@@ -367,11 +469,17 @@ struct SiteCard: View {
     /// and not in a private tab, which remembers nothing. The page reloads,
     /// as the blocker is decided for a page as it starts (#861).
     @ViewBuilder private var blocker: some View {
-        if !tab.shy, browser.prefs.shielded, Shield.shared.trouble == nil,
-           let url = tab.pageAddress, ["http", "https"].contains(url.scheme?.lowercased()),
-           let host = browser.curtain.host(of: url) {
+        if let host = Self.blockerHost(tab, browser) {
             Blocker(host: host) { tab.reload() }
         }
+    }
+
+    /// The site the blocker line is about, when the card has that line.
+    static func blockerHost(_ tab: Tab, _ browser: Browser) -> String? {
+        guard !tab.shy, browser.prefs.shielded, Shield.shared.trouble == nil,
+              let url = tab.pageAddress, ["http", "https"].contains(url.scheme?.lowercased())
+        else { return nil }
+        return browser.curtain.host(of: url)
     }
 
     /// Whether the site may play sound by itself (see Autoplay), a switch at
@@ -394,7 +502,7 @@ struct SiteCard: View {
                 .font(MenuMetrics.font)
                 .foregroundStyle(Color(nsColor: .labelColor))
             Spacer(minLength: 24)
-            Step(symbol: "minus", help: "Zoom Out   ⌘-") { browser.zoom(by: 1 / 1.1) }
+            Step(symbol: "minus", help: "Zoom Out", shortcut: "view.zoomOut") { browser.zoom(by: 1 / 1.1) }
             Button { browser.resetZoom() } label: {
                 Text("\(Int((tab.zoom * 100).rounded()))%")
                     .font(MenuMetrics.font)
@@ -404,8 +512,8 @@ struct SiteCard: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .help("Actual Size   ⌘0")
-            Step(symbol: "plus", help: "Zoom In   ⌘+") { browser.zoom(by: 1.1) }
+            .shortcutHelp("Actual Size", "view.actualSize")
+            Step(symbol: "plus", help: "Zoom In", shortcut: "view.zoomIn") { browser.zoom(by: 1.1) }
         }
         .padding(.leading, MenuMetrics.text)
         .padding(.trailing, MenuMetrics.inset + 4)
@@ -723,6 +831,7 @@ struct SiteCard: View {
     private struct Step: View {
         let symbol: String
         let help: String
+        var shortcut: String? = nil
         let act: () -> Void
 
         @State private var hovering = false
@@ -741,7 +850,7 @@ struct SiteCard: View {
             }
             .buttonStyle(.plain)
             .onHover { hovering = $0 }
-            .help(help)
+            .shortcutHelp(help, shortcut)
         }
     }
 }
@@ -780,5 +889,27 @@ enum MenuMetrics {
     static let edge = NSColor(name: nil) { appearance in
         appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
             ? NSColor.white.withAlphaComponent(0.18) : NSColor.black.withAlphaComponent(0.26)
+    }
+}
+
+extension Browser {
+    /// Whether a tab's menu offers Site Information…: a tab with a page,
+    /// a pin's too (idea 1081), whose blocker and the rest were out of reach.
+    static func offersSiteInformation(_ tab: Tab) -> Bool {
+        !tab.isBlank && tab.address != nil
+    }
+
+    /// The tab's menu › Site Information…: the card a click on the tab you
+    /// are on shows under its address. A pin drawn as a square has no
+    /// address to open, and its own click goes back to its page: the card
+    /// hangs from the square instead.
+    func showSiteInformation(_ tab: Tab) {
+        if activeID != tab.id { select(tab) }
+        if tab.pin != nil, let square = SiteCardPanel.square(for: tab.id) {
+            if editingTab != nil { cancelTabEdit() }
+            SiteCardPanel.show(for: tab, in: self, square: square)
+        } else {
+            beginTabEdit(tab, card: true)
+        }
     }
 }

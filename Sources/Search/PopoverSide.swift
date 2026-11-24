@@ -56,6 +56,13 @@ enum PopoverSide {
         return Placement(turn: up > 0 ? .above : .under, move: across.move)
     }
 
+    /// The screens, each its whole frame and its usable part, in screen
+    /// points. The tests give a screen of their own, far off every real one,
+    /// so a window measured there is never put on the user's screen.
+    nonisolated(unsafe) static var screens: () -> [(frame: NSRect, room: NSRect)] = {
+        NSScreen.screens.map { ($0.frame, $0.visibleFrame) }
+    }
+
     /// The same for `rect` in `view`, measured on the screen the rect is on,
     /// which needn't be the one most of the window is on. As asked while the
     /// view is in no window.
@@ -63,13 +70,50 @@ enum PopoverSide {
         guard let window = view.window else { return Placement(turn: .none, move: .zero) }
         let frame = window.convertToScreen(view.convert(rect, to: nil))
         let middle = NSPoint(x: frame.midX, y: frame.midY)
-        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(middle) }) ?? window.screen
+        guard let room = screens().first(where: { $0.frame.contains(middle) })?.room ?? window.screen?.visibleFrame
         else { return Placement(turn: .none, move: .zero) }
-        return placement(of: frame, in: screen.visibleFrame, beside: beside)
+        return placement(of: frame, in: room, beside: beside)
+    }
+
+    /// Whether an arrow moved by `move` has left the `size` it pointed at:
+    /// further along than the button's own edge, it points at whatever
+    /// stands beside the button.
+    static func strays(_ move: CGVector, from size: CGSize) -> Bool {
+        abs(move.dx) > size.width / 2 || abs(move.dy) > size.height / 2
+    }
+
+    /// `move` cut down so the arrow still points at the `size` it hangs
+    /// from, at most to its edge: where the arrow can't stand clear of the
+    /// corner without leaving the button, a corner it is.
+    static func kept(_ move: CGVector, on size: CGSize) -> CGVector {
+        CGVector(dx: min(max(move.dx, -size.width / 2), size.width / 2),
+                 dy: min(max(move.dy, -size.height / 2), size.height / 2))
+    }
+
+    /// The popover without its arrow, or with it again. NSPopover has no
+    /// way of its own to say so: this is AppKit's, asked for by name, and
+    /// false where AppKit doesn't have it, the popover left as it was.
+    @discardableResult
+    static func arrow(of popover: NSPopover, hidden: Bool) -> Bool {
+        guard popover.responds(to: NSSelectorFromString("setShouldHideAnchor:")) else { return false }
+        popover.setValue(hidden, forKey: "shouldHideAnchor")
+        return true
     }
 
     /// NSPopover.show(relativeTo:of:preferredEdge:), hung as above.
-    static func show(_ popover: NSPopover, relativeTo rect: NSRect, of view: NSView, preferredEdge edge: NSRectEdge) {
+    ///
+    /// `pointed`: the rect is something drawn, a button, that the arrow
+    /// points at, not a spot picked where nothing stands. A button in the
+    /// corner of the screen is too narrow for the arrow to be moved clear
+    /// of the popover's corner and still point at it: 26 points wide, 23
+    /// from the screen's edge to its middle, the arrow went 29 along and
+    /// stood on the middle of the button beside it. Bitwarden's popup, the
+    /// first of the pinned extensions at the column's foot, opened with
+    /// its arrow on Similarweb's button. There the popover hangs from the
+    /// button as it is, without an arrow: none that is whole can point at
+    /// the button, and one that points at another says the wrong thing.
+    static func show(_ popover: NSPopover, relativeTo rect: NSRect, of view: NSView, preferredEdge edge: NSRectEdge,
+                     pointed: Bool = false) {
         let place = placement(of: rect, in: view, beside: edge == .minX || edge == .maxX)
         let flipped = view.isFlipped
         let side: NSRectEdge
@@ -78,8 +122,45 @@ enum PopoverSide {
         case .above: side = flipped ? .minY : .maxY
         case .under: side = flipped ? .maxY : .minY
         }
+        let bare = pointed && strays(place.move, from: rect.size)
+        if arrow(of: popover, hidden: bare), bare {
+            popover.show(relativeTo: rect, of: view, preferredEdge: side)
+            return
+        }
         let moved = rect.offsetBy(dx: place.move.dx, dy: flipped ? -place.move.dy : place.move.dy)
-        popover.show(relativeTo: moved, of: view, preferredEdge: side)
+        // Moved off every view that could hold it, the popover hangs from
+        // the button itself, its arrow in the corner as before.
+        let hung = holder(of: moved, in: view, edge: side) ?? (view, rect, side)
+        popover.show(relativeTo: hung.rect, of: hung.view, preferredEdge: hung.edge)
+    }
+
+    /// The view a popover is shown from, for a rect that may have been
+    /// moved off `view`: `view` itself while the rect still touches it,
+    /// else the nearest view above that it touches, with the rect, and the
+    /// side, as that view counts them. Nil when no view above holds it.
+    ///
+    /// NSPopover shows nothing, and says nothing, when the rect it is to
+    /// hang from lies wholly outside the view it is given (macOS 27.0 and
+    /// 27.2: shown with one point of the rect on the view, not with none).
+    /// A button is 26 points wide and the arrow can move up to `clearance`:
+    /// an extension's popup whose button stood first at the column's foot,
+    /// in a window against the screen's left edge, was moved 29 points and
+    /// never opened — the click loaded its page in a view no window held.
+    static func holder(of rect: NSRect, in view: NSView, edge: NSRectEdge) -> (view: NSView, rect: NSRect, edge: NSRectEdge)? {
+        if view.bounds.intersects(rect) { return (view, rect, edge) }
+        var above = view.superview
+        while let host = above {
+            let there = host.convert(rect, from: view)
+            if host.bounds.intersects(there) {
+                // A side is named in the view's own coordinates: top is
+                // maxY in one that counts y upwards, minY in a flipped one.
+                let turned = host.isFlipped != view.isFlipped
+                let side: NSRectEdge = !turned ? edge : edge == .minY ? .maxY : edge == .maxY ? .minY : edge
+                return (host, there, side)
+            }
+            above = host.superview
+        }
+        return nil
     }
 }
 
@@ -128,9 +209,14 @@ private struct HangingPopover<Popup: View>: ViewModifier {
                 case .above: hang.edge = .top
                 case .under: hang.edge = .bottom
                 }
-                // In screen points, y up; SwiftUI's own are y down.
-                if place.move != .zero {
-                    hang.anchor = .rect(.rect(CGRect(origin: CGPoint(x: place.move.dx, y: -place.move.dy), size: view.bounds.size)))
+                // In screen points, y up; SwiftUI's own are y down. Never
+                // off the view: SwiftUI's popover hung from a rect wholly
+                // outside it shows nothing and lets go of its flag at once
+                // (#1460, the puzzle 26 points wide in the screen's corner,
+                // moved 29).
+                let move = PopoverSide.kept(place.move, on: view.bounds.size)
+                if move != .zero {
+                    hang.anchor = .rect(.rect(CGRect(origin: CGPoint(x: move.dx, y: -move.dy), size: view.bounds.size)))
                 }
             }
             held = hang
@@ -158,6 +244,9 @@ private struct HangingPopover<Popup: View>: ViewModifier {
 
     final class Watched: NSView {
         var moved: (() -> Void)?
+        /// Only there to be measured: a click, a right-click above all,
+        /// goes to what it sits behind (a group's name has its menu).
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             moved?()

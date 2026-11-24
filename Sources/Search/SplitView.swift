@@ -162,7 +162,11 @@ private struct PaneLayers: View {
             Page(tab: tab, holdsPage: false, corner: corner, browser: browser)
 
             if focused {
-                Omnibox(browser: browser, over: !tab.isBlank, fitted: true, tab: tab.id)
+                if tab.isBlank { HomeGrid(browser: browser) }
+                // Over a page with the field on the window, the window's.
+                if !(browser.fieldOnWindow && !tab.isBlank) {
+                    Omnibox(browser: browser, over: !tab.isBlank, fitted: true, tab: tab.id)
+                }
             }
 
             // An empty page of a pair: the field, and the tabs already open,
@@ -212,7 +216,6 @@ private struct SplitDropPreview: View {
     /// joins: its pages are shown with the carried one among them.
     var split: TabSplit? = nil
 
-    private var target: Tab? { tabs.first { $0.id == preview.targetID } }
     private var carried: String {
         let label = tabs.first { $0.id == preview.sourceID }?.label ?? ""
         return label.isEmpty ? "New Tab" : label
@@ -289,6 +292,14 @@ private struct OpenTabs: View {
             .map { $0 }
     }
 
+    /// The Home grid's height and a gap, when this side shows it (HomeGrid,
+    /// drawn only on the side you're on).
+    private var below: CGFloat {
+        guard browser.activeID == blank.id else { return 0 }
+        let grid = HomeGrid.height(browser)
+        return grid > 0 ? grid + 20 : 0
+    }
+
     var body: some View {
         let list = candidates
         GeometryReader { geo in
@@ -307,8 +318,9 @@ private struct OpenTabs: View {
                 .padding(.horizontal, 12)
                 .frame(width: min(Metrics.fieldWidth, max(0, geo.size.width - 28)), alignment: .leading)
                 .frame(maxWidth: .infinity)
-                // Under the field, which stands 60 points above the middle.
-                .offset(y: geo.size.height / 2 + 10)
+                // Under the field, which stands 60 points above the middle,
+                // and under the Home grid when it stands there (#1381).
+                .offset(y: geo.size.height / 2 + 10 + below)
             }
         }
     }

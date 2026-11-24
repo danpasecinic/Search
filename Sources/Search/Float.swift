@@ -34,6 +34,9 @@ final class Float {
     /// Asked every half second while the window is up, for the line along the
     /// bottom edge.
     var onProgress: ((@escaping (Double, Bool) -> Void) -> Void)?
+    /// Asked every half second while the window is up: whether the video
+    /// has gone from its page (Isolate.gone), and the window with it.
+    var onGone: ((@escaping (Bool) -> Void) -> Void)?
 
     private var ticker: Timer?
 
@@ -244,6 +247,13 @@ final class Float {
                 // pointer is over the window: asked then, not every half
                 // second for a page nobody is looking at.
                 if self.controls?.isNear == true { self.refreshControls() }
+
+                // A video that ended or went closes its window, rather than
+                // leave the page's black in it (idea 923).
+                self.onGone? { [weak self] gone in
+                    guard gone, let self, self.panel != nil, self.page?.superview === ground else { return }
+                    self.onClose?()
+                }
             }
         }
     }
@@ -1165,6 +1175,79 @@ enum Isolate {
         if (document.visibilityState === 'visible') stopped = new WeakSet();
       }, true);
       window.__officeFloatUnseen = function (v) { return v.paused && stopped.has(v); };
+      // The videos heard playing, for `real`: one muted since still counts.
+      var heard = new WeakSet();
+      function listen(e) {
+        var v = e.target;
+        if (v && v.tagName === 'VIDEO' && !v.paused && !v.muted && v.volume > 0) heard.add(v);
+      }
+      ['play', 'playing', 'volumechange'].forEach(function (name) {
+        document.addEventListener(name, listen, true);
+      });
+      window.__officeFloatHeard = function (v) { return heard.has(v) || (!v.muted && v.volume > 0); };
+    })();
+    """
+
+    /// Which videos float out on their own, set just before `on` looks
+    /// (Browser.lift, NativePiP.script): one somebody is watching, and not
+    /// whatever else plays on the page. YouTube's home page plays a muted
+    /// preview of the thumbnail under the pointer, and leaving the tab
+    /// floated that, then a black window once the preview ended (idea 923).
+    /// As Safari (main content: audio, about 400×300 or more) and Chrome or
+    /// Arc (audible in the last two seconds, unmuted) ask: heard, now or
+    /// earlier and muted since by hand; big enough to be watched; longer
+    /// than a loop; and not a preview in a link or a thumbnail. ⇧⌘P sets
+    /// nothing and still lifts any video playing.
+    static let real = """
+    window.__officeFloatOnly = function (v) {
+      var heard = window.__officeFloatHeard ? window.__officeFloatHeard(v) : (!v.muted && v.volume > 0);
+      if (!heard) return false;
+      if (isFinite(v.duration) && v.duration > 0 && v.duration < 10) return false;
+      var b = v.getBoundingClientRect();
+      if (v.videoWidth > 0 && b.width > 0 && b.height > 0 && b.width * b.height < 320 * 180) return false;
+      for (var up = v; up && up !== document.body && up !== document.documentElement; up = up.parentElement) {
+        if (up !== v && up.tagName === 'A' && up.hasAttribute('href')) return false;
+        var name = up.tagName + ' ' + (up.id || '') + ' ' + (typeof up.className === 'string' ? up.className : '');
+        if (/(^|[\\s_-])(preview|thumbnail)(?=$|[\\s_-])/i.test(name) || /(^|[\\s_-])(preview|thumbnail)[A-Z]/.test(name)) return false;
+      }
+      return true;
+    };
+    """
+
+    /// `on`, for a video floating out on its own: only one of the `real`.
+    static let quietly = real + on
+
+    /// Whether the floated video has gone: taken out of the page, emptied
+    /// of its source, hidden with its player, or ended a while ago with
+    /// nothing after it. YouTube's preview ended and went, and the window
+    /// held the page's black (idea 923). A second's grace for a player
+    /// swapping one video for the next (Isolate.on puts the mark back), and
+    /// ten after an end, for a player's "up next" to begin.
+    static let gone = """
+    (function () {
+      if (!document.documentElement.classList.contains('office-floating')) {
+        window.__officeFloatGone = null;
+        return false;
+      }
+      var art = !!window.__officeFloatArt;
+      function shows(v) {
+        return v.isConnected && !v.error && (v.currentSrc || v.srcObject) && v.readyState > 0
+          && (art || v.getClientRects().length > 0);
+      }
+      var v = document.querySelector('video[data-office-float]'), why = null;
+      if (!v || !shows(v)) why = 'gone';
+      else if (v.ended) why = 'ended';
+      if (why) {
+        var all = document.querySelectorAll('video');
+        for (var i = 0; i < all.length; i++) {
+          var one = all[i];
+          if (one !== v && !one.paused && !one.ended && one.readyState >= 2 && shows(one)) { why = null; break; }
+        }
+      }
+      var was = window.__officeFloatGone;
+      if (!why) { window.__officeFloatGone = null; return false; }
+      if (!was || was.why !== why) { window.__officeFloatGone = { why: why, since: Date.now() }; return false; }
+      return Date.now() - was.since >= (why === 'ended' ? 10000 : 1000);
     })();
     """
 
@@ -1176,12 +1259,68 @@ enum Isolate {
     (function () {
       var videos = document.querySelectorAll('video');
       var unseen = window.__officeFloatUnseen || function () { return false; };
-      var best = null, area = 0;
+      // Floating out on its own, only a video somebody watches (see real).
+      var only = window.__officeFloatOnly;
+      window.__officeFloatOnly = null;
+      // A video with a picture to show, before one without: YouTube Music
+      // plays a song through a video that is hidden, or has no picture at
+      // all, and shows the album's cover beside it. Floated as a video, the
+      // window showed whatever of the player was left, its buttons and tabs.
+      function pictured(v) {
+        var b = v.getBoundingClientRect();
+        return v.videoWidth > 0 && v.videoHeight > 0 && b.width > 0 && b.height > 0;
+      }
+      var best = null, area = 0, blind = null, most = 0;
       for (var i = 0; i < videos.length; i++) {
         var v = videos[i];
         if ((v.paused && !unseen(v)) || v.ended || v.readyState < 2) continue;
+        if (only && !only(v)) continue;
         var box = v.getBoundingClientRect();
-        if (box.width * box.height >= area) { area = box.width * box.height; best = v; }
+        if (!pictured(v)) {
+          if (box.width * box.height >= most) { most = box.width * box.height; blind = v; }
+        } else if (box.width * box.height >= area) { area = box.width * box.height; best = v; }
+      }
+      // Such a song floats as its cover: the one the page gives the system
+      // for Now Playing, or else the largest picture in its player. With
+      // neither there is nothing to show, and nothing floats.
+      var art = document.getElementById('office-float-art');
+      if (art) art.remove();
+      window.__officeFloatArt = null;
+      if (!best && blind) {
+        var cover = coverOf(blind);
+        if (!cover) return 'none';
+        best = blind;
+        art = document.createElement('img');
+        art.id = 'office-float-art';
+        art.alt = '';
+        art.src = cover;
+        document.body.appendChild(art);
+        window.__officeFloatArt = function () {
+          var now = coverOf(best);
+          if (now && art.getAttribute('src') !== now) art.src = now;
+        };
+      }
+      function coverOf(v) {
+        try {
+          var meta = navigator.mediaSession && navigator.mediaSession.metadata;
+          var list = meta && meta.artwork ? Array.prototype.slice.call(meta.artwork) : [];
+          var pick = null, side = -1;
+          for (var a = 0; a < list.length; a++) {
+            var n = parseInt(String(list[a].sizes || '0').split('x')[0], 10) || 0;
+            if (list[a].src && n > side) { side = n; pick = list[a].src; }
+          }
+          if (pick) return pick;
+        } catch (e) {}
+        for (var up = v.parentElement; up && up !== document.body && up !== document.documentElement; up = up.parentElement) {
+          var found = null, big = 64 * 64, imgs = up.querySelectorAll('img');
+          for (var k = 0; k < imgs.length; k++) {
+            var r = imgs[k].getBoundingClientRect(), s = getComputedStyle(imgs[k]);
+            if (!imgs[k].currentSrc || s.visibility !== 'visible' || s.opacity === '0') continue;
+            if (r.width * r.height >= big) { big = r.width * r.height; found = imgs[k].currentSrc; }
+          }
+          if (found) return found;
+        }
+        return null;
       }
       if (!best) return 'none';
 
@@ -1226,6 +1365,14 @@ enum Isolate {
         'html.office-floating, html.office-floating body {',
         'background:#000 !important; overflow:hidden !important; margin:0 !important}',
         'html.office-floating body > * { visibility:hidden !important }',
+        // And everything else, ancestors of the video aside: a part that
+        // makes itself visible again comes back whatever its ancestors say.
+        // YouTube Music's do — its top bar, side drawer, the page's content
+        // and the player bar at the foot, fixed and above the player — and
+        // floating a music video from a playlist, the little window showed
+        // them over the video, the player bar's buttons stacked (idea 933).
+        'html.office-floating body *:not([data-office-float]):not(:has([data-office-float])):not(#office-float-art)',
+        ':not(.player-timedtext):not(.player-timedtext *) { visibility:hidden !important }',
         'html.office-floating [data-office-float] {',
         'visibility:visible !important; position:fixed !important;',
         'left:0 !important; top:0 !important; right:0 !important; bottom:0 !important;',
@@ -1280,12 +1427,25 @@ enum Isolate {
         'filter:none !important; backdrop-filter:none !important; -webkit-backdrop-filter:none !important;',
         'perspective:none !important; contain:none !important; container-type:normal !important;',
         'will-change:auto !important; content-visibility:visible !important;',
+        // A transform on its way somewhere wins over all of this until it
+        // gets there: YouTube Music's player slides up over the page, and
+        // left before it had, or out of sight, where it never moves, the
+        // video was a window's height below the little window.
+        'transition:none !important; animation:none !important;',
         'clip-path:none !important; mask:none !important; -webkit-mask:none !important;',
         'opacity:1 !important}',
         // The player's own controls would sit under ours, and two sets of
         // buttons on one small window is one set too many.
         'html.office-floating [data-office-float]::-webkit-media-controls {',
-        'display:none !important}'
+        'display:none !important}',
+        // A song's cover, over the whole window and whatever is under it.
+        'html.office-floating #office-float-art {',
+        'visibility:visible !important; display:block !important; position:fixed !important;',
+        'left:0 !important; top:0 !important; width:100vw !important; height:100vh !important;',
+        'margin:0 !important; padding:0 !important; border:0 !important; background:#000 !important;',
+        'object-fit:contain !important; opacity:1 !important; transform:none !important;',
+        'z-index:2147483647 !important; pointer-events:none !important}',
+        'html:not(.office-floating) #office-float-art { display:none !important}'
       ].join('');
       document.documentElement.classList.add('office-floating');
 
@@ -1306,6 +1466,8 @@ enum Isolate {
       if (window.__officeFloatUnwatch) window.__officeFloatUnwatch();
       clearInterval(window.__officeFloatWatch);
       var remark = function () {
+        // The next song's cover, once the page has it.
+        if (window.__officeFloatArt) window.__officeFloatArt();
         if (document.querySelector('[data-office-float]')) return;
         var again = null, most = 0;
         var all = document.querySelectorAll('video');
@@ -1340,6 +1502,8 @@ enum Isolate {
       // Where the picture is once the rest of the page is out of the way,
       // as large as it goes whole and in the middle, for cutting it out of a
       // picture of the page taken then (Float.still, Browser.lift).
+      // A cover has no frame to cut out yet: the window's black until it is in.
+      if (window.__officeFloatArt) return { floating: true, page: [innerWidth, innerHeight] };
       var whole = shown[0] && shown[1] ? shown : [vw, vh];
       var by = Math.min(innerWidth / whole[0], innerHeight / whole[1]) || 0;
       var alone = [(innerWidth - whole[0] * by) / 2, (innerHeight - whole[1] * by) / 2, whole[0] * by, whole[1] * by];
@@ -1444,6 +1608,9 @@ enum Isolate {
         if (sheet) sheet.textContent = '';
         var video = document.querySelector('[data-office-float]');
         if (video) video.removeAttribute('data-office-float');
+        var art = document.getElementById('office-float-art');
+        if (art) art.remove();
+        window.__officeFloatArt = null;
         settle(video);
         reopen();
         redraw(video);

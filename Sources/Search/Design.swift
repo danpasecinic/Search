@@ -17,23 +17,11 @@ enum Palette {
     static let faint = Color(nsColor: NS.faint)         // neutral-300 · neutral-700
     static let hairline = Color(nsColor: NS.hairline)   // neutral-200 · neutral-800
     static let wash = Color(nsColor: NS.wash)           // the live tab
-    /// The live pin: among squares that already wear a faint grey, the one
-    /// you are on stands out from them as a live row does from the white.
-    static let pinLive = Color(nsColor: NS.pinLive)
     static let hover = Color(nsColor: NS.hover)         // the one under the pointer
     /// Around the page's card, with the tabs down the side: the column, the
     /// bookmarks bar and the gaps share it, a touch off the page's white, so
     /// the card reads as one (see CardEdge).
     static let frame = Color(nsColor: NS.frame)
-    /// The column's own greys, on that ground: the live tab, the one under the
-    /// pointer, the resting pin squares and the live pin. The white column's
-    /// wash, hover and pinLive all but vanished on it (Drice: the pins' squares
-    /// and the open tab no longer showed), so these keep the same steps of
-    /// contrast from the frame that those kept from the white.
-    static let sideWash = Color(nsColor: NS.sideWash)
-    static let sideHover = Color(nsColor: NS.sideHover)
-    static let sideTile = Color(nsColor: NS.sideTile)
-    static let sidePinLive = Color(nsColor: NS.sidePinLive)
     /// The only two that aren't grey: a connection nobody can read on the
     /// way, and one anybody can (see SiteCard.swift).
     static let safe = Color(nsColor: NS.safe)           // green-700 · green-400
@@ -48,13 +36,8 @@ enum Palette {
         static let faint = pair(0.83, 0.32)
         static let hairline = pair(0.91, 0.20)
         static let wash = pair(0.937, 0.175)
-        static let pinLive = pair(0.90, 0.21)
         static let hover = pair(0.965, 0.15)
         static let frame = pair(0.955, 0.075)
-        static let sideWash = pair(0.895, 0.155)
-        static let sideHover = pair(0.915, 0.13)
-        static let sideTile = pair(0.925, 0.115)
-        static let sidePinLive = pair(0.86, 0.19)
         /// The resting traffic lights, drawn by hand when the app is behind.
         static let resting = pair(0.80, 0.30)
         static let safe = tint(light: (0.08, 0.50, 0.24), dark: (0.29, 0.87, 0.50))
@@ -204,11 +187,21 @@ enum Metrics {
     /// first item sits in Safari. A column too narrow for that gives back
     /// what it must (SideBar.lights), down to where it was.
     static let sideLights: CGFloat = 80
+    /// The least of it the fold door may have: its box 3 points clear of
+    /// the zoom button (SideBar.folds).
+    static let sideLightsLeast: CGFloat = 72
     /// The three doors' own width, without the air after them.
     static let helmDoors: CGFloat = 3 * 26 + 2 * 4
-    /// The band left at the top when there is no strip: just enough for the
-    /// traffic lights to sit in, and nothing else.
-    static let bare: CGFloat = 34
+    /// The same two, for the doors Settings leaves shown (idea 815): all
+    /// three unless some are hidden, nothing when none is.
+    @MainActor static func helm(_ prefs: Preferences) -> CGFloat {
+        let n = CGFloat(prefs.helmDoors)
+        return n == 0 ? 0 : n * 26 + (n - 1) * 2 + 8
+    }
+    @MainActor static func helmDoors(_ prefs: Preferences) -> CGFloat {
+        let n = CGFloat(prefs.helmDoors)
+        return n == 0 ? 0 : n * 26 + (n - 1) * 4
+    }
     /// Tabs are a fixed width rather than the width of their titles, so the
     /// cross always lands in the same place and the row never rearranges
     /// itself while you read it. They give way when there are too many:
@@ -216,18 +209,50 @@ enum Metrics {
     /// stop at tabMinWidth, the mark and its air. Past that the row scrolls,
     /// inside its own edges.
     static let tabWidth: CGFloat = 186
-    static let tabTitled: CGFloat = 80
+    /// A titled tab's own parts, end to end (TabPill.titled): its air at
+    /// the left, the mark, a gap, the title, a gap, the spring at its
+    /// least, a gap, the slot the cross and the ring take (kept while
+    /// empty, so the title doesn't move under the pointer), its air at the
+    /// right. Everything but the title.
+    static let tabLead: CGFloat = 11
+    static let tabTrail: CGFloat = 7
+    static let tabMark: CGFloat = 15
+    static let tabSpacing: CGFloat = 6
+    static let tabSpring: CGFloat = 2
+    static let tabCloseSlot: CGFloat = 15
+    static let tabFixed: CGFloat = tabLead + tabMark + tabSpacing + tabSpacing + tabSpring + tabSpacing + tabCloseSlot + tabTrail
+    /// The least a title is given: three letters and the "…", as most
+    /// titles' letters run at 12.5 points ("Rec…" is 32, "Wea…" 35). Less
+    /// than that and a tab showed its mark and a lone "…", or a letter or
+    /// two, which says nothing a mark alone doesn't; it shows the mark
+    /// alone instead.
+    static let tabTitleRoom: CGFloat = 36
+    /// A sign before the title (a blocked window, a translation), framed
+    /// this wide; the bare ones (a script's flask, a private eye, the
+    /// recording dot) are a symbol of 9 or 10 points, about tabGlyph.
+    static let tabSign: CGFloat = 17
+    static let tabGlyph: CGFloat = 12
+    /// 104: narrower than this a tab is its mark alone.
+    static let tabTitled: CGFloat = tabFixed + tabTitleRoom
     static let tabMinWidth: CGFloat = 36
     static let tabGap: CGFloat = 2
     /// A pinned tab is a square the height of the row, holding one letter.
     static let pinWidth: CGFloat = 30
     /// The square at the end of the row that opens a new page.
     static let plusWidth: CGFloat = 30
+    /// What a full row of tabs still leaves past the plus to take the window
+    /// by, as Chrome's does: the tabs give way before it. Without it they ran
+    /// up to the buttons at the far end, and the corner the lights sit in was
+    /// all of the row that moved the window.
+    static let tabRowHold: CGFloat = 40
     /// The address field, in both the places it shows up.
     static let fieldWidth: CGFloat = 560
     /// The column of titles down the left, in the way that has one.
     static let side: CGFloat = 232
     static let sideMin: CGFloat = 176
+    /// Narrower than this, with Narrow to icons on, the column is the strip
+    /// of icons (Preferences.narrowStrip).
+    static let narrowLine: CGFloat = 200
     static let sideMax: CGFloat = 440
 }
 
@@ -355,6 +380,15 @@ enum Motion {
     /// in Core Animation's terms.
     static func fold(out: Bool) -> (response: Double, damping: Double) {
         out ? (0.14, 0.86) : (0.13, 1)
+    }
+
+    /// How long the folded column takes to slide back in, or fade, and
+    /// is still over the page: the spring's response (Motion.fold) runs a
+    /// little past it.
+    static var columnAway: TimeInterval {
+        if reduced { return 0 }
+        if fadesColumn { return fade }
+        return slide(out: false) ?? 0.2
     }
 
     static func folding(out: Bool) -> Animation? {

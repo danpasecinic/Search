@@ -11,11 +11,11 @@ import WebKit
 // signed in (#837). Chrome counts a host the extension has been granted as
 // same-site.
 //
-// So the shim sends such a fetch — credentials "include" from the
-// extension's own page or worker, or "same-origin" (the default) from its
-// page, to another http(s) origin, and any fetch from its worker to an
-// app on this Mac (localhost: WebKit holds a worker to CORS there, and
-// Eagle's app sends no CORS headers) — here, over a native port. WebKit
+// So the shim sends such a fetch — credentials "include" or "same-origin"
+// (the default) from the extension's own page or worker to another http(s)
+// origin, and any fetch from its worker to an app on this Mac (localhost:
+// WebKit holds a worker to CORS there, and Eagle's app sends no CORS
+// headers) — here, over a native port. WebKit
 // says which extension opened the port; no page or other extension can
 // speak for it. Here, and only for an address that
 // extension has been granted (checked again on every redirect: a hop to an
@@ -125,11 +125,17 @@ enum ExtensionFetch {
     /// The store whose cookies go: that of the windows the request can
     /// belong to — the ones whose side panel shows the extension, else every
     /// window — only when they all share one. One controller serves every
-    /// profile, and a worker or a popup doesn't say which window it is for:
-    /// with windows of different profiles or spaces open, it isn't known
-    /// whose sign-in to send, and nothing is ("pass"). Never a private
-    /// tab's store: panelStore never returns one.
-    static func store(for context: WKWebExtensionContext) -> WKWebsiteDataStore? {
+    /// profile, and a worker doesn't say which window it is for: with
+    /// windows of different profiles or spaces open, it isn't known whose
+    /// sign-in to send, and nothing is ("pass"). The extension's popup does:
+    /// the window it was opened from, as Chrome sends the popup's profile's
+    /// cookies — with a second window on another space, Monarch's "Connect
+    /// Amazon" found Amazon signed out and did nothing (idea 1045). Never a
+    /// private tab's store: panelStore never returns one.
+    static func store(for context: WKWebExtensionContext, popup: Bool = false) -> WKWebsiteDataStore? {
+        if popup, let browser = ExtensionPopup.shared.browser(for: context.uniqueIdentifier) {
+            return browser.panelStore(browser.spaceID)
+        }
         let showing = Browsers.all.filter { browser in
             if browser.sidePanelShown, case .page(let id, _, _)? = browser.sidePanel { return id == context.uniqueIdentifier }
             return false
@@ -704,6 +710,12 @@ enum ExtensionFetch {
         private var id: String?
         private var mode = "follow"
         private var headerRules: [[String: Any]] = []
+        /// What the shim asked to be told of the request as it goes out,
+        /// for the extension's own webRequest listeners: "sent", "headers",
+        /// or "extra", the Cookie header with them. Nil: nothing.
+        private var tell: String?
+        /// Sent from the extension's popup page, which says so (the shim).
+        private var popup = false
         private var redirected = false
         private var stopped = false
         private var ended = false
@@ -750,7 +762,8 @@ enum ExtensionFetch {
             // An app on this Mac is reached without a store: a worker's fetch
             // there comes here for CORS (see the shim), not for cookies, and
             // then goes with none when it isn't known whose to send.
-            let store = ExtensionFetch.store(for: context)
+            popup = message["popup"] as? Bool == true
+            let store = ExtensionFetch.store(for: context, popup: popup)
             guard store != nil || ExtensionFetch.loopback(url) else {
                 ExtensionFetch.note(["pass": address, "extension": context.uniqueIdentifier])
                 return pass()
@@ -768,12 +781,16 @@ enum ExtensionFetch {
             if ExtensionFetch.mayUseHeaderRules(context), let rules = message["headerRules"] as? [[String: Any]] {
                 headerRules = Array(rules.prefix(500))
             }
+            if context.hasPermission(.webRequest), let tell = message["tell"] as? String, ["sent", "headers", "extra"].contains(tell) {
+                self.tell = tell
+            }
             let unsigned = request
             Task { @MainActor in
                 var request = unsigned
                 await self.applyHeaderRules(to: &request)
                 await self.sign(&request)
                 guard !self.ended else { return }
+                self.tellSent(request)
                 let configuration = URLSessionConfiguration.ephemeral
                 configuration.httpShouldSetCookies = false
                 configuration.httpCookieAcceptPolicy = .never
@@ -812,6 +829,23 @@ enum ExtensionFetch {
             if !changes.isEmpty { ExtensionFetch.note(["ruleHeaders": changes.map { "\($0.operation) \($0.name)" }, "for": url.absoluteString]) }
         }
 
+        /// The request as it goes out, said to the shim that asked: Chrome
+        /// tells an extension's webRequest listeners of the extension's own
+        /// requests, and this one nothing else sees (see ownRequests in the
+        /// shim). Only to an extension that holds webRequest, only for an
+        /// address it is granted (nothing else is sent from here), and the
+        /// Cookie header only when asked for with "extraHeaders".
+        private func tellSent(_ request: URLRequest) {
+            guard let tell, let url = request.url else { return }
+            var headers: [[String]] = []
+            if tell != "sent" {
+                for (name, value) in request.allHTTPHeaderFields ?? [:] where tell == "extra" || name.lowercased() != "cookie" {
+                    headers.append([name, value])
+                }
+            }
+            post(["sent": ["url": url.absoluteString, "method": request.httpMethod ?? "GET", "headers": headers]])
+        }
+
         /// The cookies for the request's address (granted: sign is only
         /// reached for one).
         private func sign(_ request: inout URLRequest) async {
@@ -821,7 +855,8 @@ enum ExtensionFetch {
             for (k, v) in HTTPCookie.requestHeaderFields(with: cookies) { request.setValue(v, forHTTPHeaderField: k) }
             ExtensionFetch.note(["native": url.absoluteString, "method": request.httpMethod ?? "GET", "origin": origin,
                                  "extension": context.uniqueIdentifier, "cookies": cookies.map(\.name).sorted(),
-                                 "store": Browsers.all.contains { $0.panelStore($0.spaceID) === store } ? "space" : "other"])
+                                 "store": Browsers.all.contains { $0.panelStore($0.spaceID) === store } ? "space" : "other",
+                                 "popup": popup])
         }
 
         nonisolated func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
@@ -852,6 +887,7 @@ enum ExtensionFetch {
                 var hop = ExtensionFetch.hop(request, from: response.url)
                 await self.applyHeaderRules(to: &hop)
                 await self.sign(&hop)
+                self.tellSent(hop)
                 self.redirected = true
                 handler(hop)
             }
